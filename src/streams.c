@@ -81,8 +81,15 @@ static void uv__stream_close_cb(uv_handle_t *handle) {
 }
 
 static void maybe_close(TJSStream *s) {
-    if (!uv_is_closing(&s->h.handle))
+  if (!uv_is_closing(&s->h.handle)) {
+    if (!JS_IsUndefined(s->accept.result.p)) {
+      /*we have waiting .listen(), reject it with null so async function can exit properly  */
+      JSValueConst arg = JS_NULL;
+      TJS_SettlePromise(s->ctx, &s->accept.result, 1, 1, &arg);
+      TJS_ClearPromise(s->ctx, &s->accept.result);
+    }
         uv_close(&s->h.handle, uv__stream_close_cb);
+}
 }
 
 static JSValue tjs_stream_close(JSContext *ctx, TJSStream *s, int argc, JSValueConst *argv) {
@@ -748,6 +755,20 @@ static JSValue tjs_pipe_getsockpeername(JSContext *ctx,
     return JS_NewStringLen(ctx, buf, len);
 }
 
+/* compose pipe name in system independent manner.
+   NOTE: pipe.connect() and pipe.bind() shall be given just filename - but not paths with '/' */
+static char* compose_pipe_name(const char* logical_pipe_name, char* buf, size_t len)
+{
+#ifdef _WIN32
+  strcpy(buf, "\\\\.\\pipe\\");
+  strncat(buf, logical_pipe_name, len - 10);
+#else
+  strcpy(buf,"/tmp/");
+  strncat(buf, logical_pipe_name, len - 6);
+#endif
+  return buf;
+}
+
 static JSValue tjs_pipe_connect(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     TJSStream *t = tjs_pipe_get(ctx, this_val);
     if (!t)
@@ -764,7 +785,9 @@ static JSValue tjs_pipe_connect(JSContext *ctx, JSValueConst this_val, int argc,
     }
     cr->req.data = cr;
 
-    uv_pipe_connect(&cr->req, &t->h.pipe, name, uv__stream_connect_cb);
+    char buf[512];
+
+    uv_pipe_connect(&cr->req, &t->h.pipe, compose_pipe_name(name,buf,countof(buf)), uv__stream_connect_cb);
 
     JS_FreeCString(ctx, name);
 
@@ -780,7 +803,9 @@ static JSValue tjs_pipe_bind(JSContext *ctx, JSValueConst this_val, int argc, JS
     if (!name)
         return JS_EXCEPTION;
 
-    int r = uv_pipe_bind(&t->h.pipe, name);
+    char buf[512];
+
+    int r = uv_pipe_bind(&t->h.pipe, compose_pipe_name(name, buf, countof(buf)));
     if (r != 0)
         return tjs_throw_errno(ctx, r);
 
