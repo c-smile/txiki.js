@@ -82,14 +82,20 @@ static void uv__stream_close_cb(uv_handle_t *handle) {
 
 static void maybe_close(TJSStream *s) {
   if (!uv_is_closing(&s->h.handle)) {
-    if (!JS_IsUndefined(s->accept.result.p)) {
+    if (TJS_IsPromisePending(s->ctx,&s->accept.result)) {
       /*we have waiting .listen(), reject it with null so async function can exit properly  */
       JSValueConst arg = JS_NULL;
       TJS_SettlePromise(s->ctx, &s->accept.result, 1, 1, &arg);
       TJS_ClearPromise(s->ctx, &s->accept.result);
     }
-        uv_close(&s->h.handle, uv__stream_close_cb);
-}
+    if (TJS_IsPromisePending(s->ctx, &s->read.result)) {
+      /*we have waiting .read(), reject it with null so async function can exit properly  */
+      JSValueConst arg = JS_NULL;
+      TJS_SettlePromise(s->ctx, &s->read.result, 1, 1, &arg);
+      TJS_ClearPromise(s->ctx, &s->read.result);
+    }
+    uv_close(&s->h.handle, uv__stream_close_cb);
+  }
 }
 
 static JSValue tjs_stream_close(JSContext *ctx, TJSStream *s, int argc, JSValueConst *argv) {
