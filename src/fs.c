@@ -866,6 +866,202 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValueConst this_val, int argc, 
     return TJS_InitPromise(ctx, &fr->result);
 }
 
+static JSValue tjs_fs_splitpath(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { 
+  const char *path = argc ? JS_ToCString(ctx, argv[0]) : NULL;
+  if (!path)
+    return JS_EXCEPTION;
+
+  JSValue rv[2];
+  
+#ifdef _WIN32
+  char cdrive[_MAX_DRIVE];
+  char cdir[_MAX_DIR];
+  char cname[_MAX_FNAME];
+  char cext[_MAX_EXT];
+  cdrive[0] = 0;
+  cdir[0] = 0;
+  cname[0] = 0;
+  cext[0] = 0;
+  _splitpath(path, cdrive, cdir, cname, cext);
+  char buffer[MAX_PATH];
+  int n = snprintf(buffer, countof(buffer), "%s%s", cdrive, cdir);
+  if( n <= 0 || n == countof(buffer))
+    return JS_EXCEPTION;
+  buffer[n - 1] = '\0'; // drop last '\'
+  rv[0] = JS_NewString(ctx, buffer);
+  if(cext[0])
+    snprintf(buffer, countof(buffer), "%s.%s", cdrive, cext);
+  else 
+    snprintf(buffer, countof(buffer), "%s", cname);
+  rv[1] = JS_NewString(ctx, buffer);
+#else
+  rv[0] = JS_NewString(ctx, dirname(path));
+  rv[1] = JS_NewString(ctx, basename(path));
+#endif // _WIN32
+  
+  JSValue r = JS_NewFastArray(ctx, 2, rv);
+  JS_FreeValue(ctx, rv[0]);
+  JS_FreeValue(ctx, rv[1]);
+  return r;
+}
+
+
+typedef struct 
+{
+  uv_fs_event_t req;
+  JSContext*    ctx;
+  JSValue       callback; // addrefed 
+  JSValue       obj; // not addrefed, sic! 
+} TJSWatch;
+
+static JSClassID tjs_watch_class_id;
+
+static TJSWatch *tjs_watch_get(JSContext *ctx, JSValueConst obj) {
+  return JS_GetOpaque2(ctx, obj, tjs_watch_class_id);
+}
+
+void tjs_watch_fs_event_close_cb(uv_handle_t* handle) {
+  TJSWatch *pw = (TJSWatch *)handle->data;
+  if (!pw) return;
+  js_free(pw->ctx, pw);
+}
+
+static int tjs_watch_stop(JSRuntime *rt, TJSWatch * pw)
+{
+  JS_FreeValueRT(rt, pw->callback);
+  uv_close((uv_handle_t*)(&pw->req), tjs_watch_fs_event_close_cb);
+  //int r = uv_fs_event_stop(&pw->req); - wrong
+  return 0;
+}
+
+static void tjs_watch_finalizer(JSRuntime *rt, JSValue val) {
+  TJSWatch *pw = JS_GetOpaque(val, tjs_watch_class_id);
+  if (pw)
+    tjs_watch_stop(rt, pw);
+}
+
+static JSClassDef tjs_watch_class = { "WatchFS",.finalizer = tjs_watch_finalizer };
+
+static JSValue tjs_watch_close(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  TJSWatch *pw = tjs_watch_get(ctx, this_val);
+  if (!pw)
+    return JS_EXCEPTION;
+
+  int r = tjs_watch_stop(JS_GetRuntime(ctx), pw);
+
+  JS_SetOpaque(this_val, NULL);
+
+  if (r != 0)
+    return tjs_throw_errno(ctx, r);
+
+  return JS_UNDEFINED;
+}
+
+static JSValue tjs_watch_path_get(JSContext *ctx, JSValueConst this_val) {
+  TJSWatch *pw = tjs_watch_get(ctx, this_val);
+  if (!pw)
+    return JS_UNDEFINED;
+
+  char buffer[1024]; memset(buffer, 0, countof(buffer));
+
+  size_t sz = countof(buffer);
+
+  int r = uv_fs_event_getpath(&pw->req, buffer, &sz);
+
+  if (r != 0)
+    return tjs_throw_errno(ctx, r);
+
+  return JS_NewStringLen(ctx, buffer, sz);
+}
+
+#ifdef SCITERJS
+  void js_sciter_dump_error(JSContext *ctx, JSValue err);  
+#endif
+
+void tjs_watch_fs_event_cb(uv_fs_event_t* handle, const char* filename, int events, int status) {
+  TJSWatch *pw = (TJSWatch *)handle->data;
+  if (!pw) return;
+  JSValue args[3] = {
+    JS_NewString(pw->ctx, filename),
+    JS_NewInt32(pw->ctx,events),
+    JS_NewInt32(pw->ctx,status) 
+  };
+  JSValue rw = JS_Call(pw->ctx, pw->callback, pw->obj, 3, args);
+  if (JS_IsException(rw)) {
+#ifdef SCITERJS
+    js_sciter_dump_error(pw->ctx, rw);
+#else 
+    js_std_dump_error(pw->ctx);
+#endif
+    // do we need to destroy the thing here?
+  }
+}
+
+static JSValue tjs_fs_watch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) 
+{
+  if (argc < 2)
+    return JS_EXCEPTION;
+
+  if (!JS_IsFunction(ctx, argv[1]))
+    return JS_ThrowTypeError(ctx, "no callback function provided");
+
+  JSValue cb = JS_UNINITIALIZED;
+  JSValue obj = JS_UNINITIALIZED;
+  const char *path = NULL;
+  TJSWatch *pw = NULL;
+  int err = 0;
+
+  do {
+    
+    path = JS_ToCString(ctx, argv[0]);
+
+    if (!path)
+      break;
+
+    pw = js_malloc(ctx, sizeof(*pw));
+    if (!pw)
+      break;
+
+    pw->ctx = ctx;
+    err = uv_fs_event_init(tjs_get_loop(ctx), &pw->req);
+    if (err < 0)
+      break;
+
+    pw->req.data = pw;
+    
+    err = uv_fs_event_start(&pw->req, tjs_watch_fs_event_cb, path, UV_FS_EVENT_RECURSIVE);
+    if (err < 0)
+      break;
+
+    obj = JS_NewObjectClass(ctx, tjs_watch_class_id);
+    if (JS_IsException(obj))
+      break;
+
+    pw->callback = JS_DupValue(ctx, argv[1]);
+    pw->obj = obj;
+
+    JS_SetOpaque(obj, pw);
+    return obj;
+
+  } while (false);
+
+  if (path) 
+    JS_FreeCString(ctx, path);
+  if (pw) 
+    js_free(ctx, pw);
+  if (err)
+    return tjs_throw_errno(ctx, err);
+  if (obj != JS_UNINITIALIZED)
+    return obj;
+  return JS_EXCEPTION;
+}
+
+static const JSCFunctionListEntry tjs_watch_proto_funcs[] = {
+    JS_CFUNC_DEF("close", 0, tjs_watch_close),
+    JS_CGETSET_DEF("path", tjs_watch_path_get, NULL),
+    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "WatchFS", JS_PROP_CONFIGURABLE),
+};
+
 static const JSCFunctionListEntry tjs_file_proto_funcs[] = {
     JS_CFUNC_DEF("read", 2, tjs_file_read),
     JS_CFUNC_DEF("write", 2, tjs_file_write),
@@ -897,10 +1093,14 @@ static const JSCFunctionListEntry tjs_fs_funcs[] = {
     TJS_CONST(UV_FS_COPYFILE_FICLONE),
     TJS_CONST(UV_FS_COPYFILE_FICLONE_FORCE),
     TJS_CONST(S_IFMT),
+#ifdef S_IFIFO
     TJS_CONST(S_IFIFO),
+#endif // S_IFIFO
     TJS_CONST(S_IFCHR),
     TJS_CONST(S_IFDIR),
+#ifdef S_IFBLK
     TJS_CONST(S_IFBLK),
+#endif // S_IFBLK
     TJS_CONST(S_IFREG),
 #ifdef S_IFSOCK
     TJS_CONST(S_IFSOCK),
@@ -924,6 +1124,9 @@ static const JSCFunctionListEntry tjs_fs_funcs[] = {
     JS_CFUNC_DEF("copyfile", 3, tjs_fs_copyfile),
     JS_CFUNC_DEF("readdir", 1, tjs_fs_readdir),
     JS_CFUNC_DEF("readFile", 1, tjs_fs_readfile),
+    JS_CFUNC_DEF("readfile", 1, tjs_fs_readfile),
+    JS_CFUNC_DEF("watch", 1, tjs_fs_watch),
+    JS_CFUNC_DEF("splitpath", 1, tjs_fs_splitpath),
 };
 
 void tjs_mod_fs_init(JSContext *ctx, JSModuleDef *m) {
@@ -942,6 +1145,15 @@ void tjs_mod_fs_init(JSContext *ctx, JSModuleDef *m) {
     proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, tjs_dir_proto_funcs, countof(tjs_dir_proto_funcs));
     JS_SetClassProto(ctx, tjs_dir_class_id, proto);
+
+    /* Watch object */
+    JS_NewClassID(&tjs_watch_class_id);
+    JS_NewClass(JS_GetRuntime(ctx), tjs_watch_class_id, &tjs_watch_class);
+    proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, proto, tjs_watch_proto_funcs, countof(tjs_watch_proto_funcs));
+    JS_SetClassProto(ctx, tjs_watch_class_id, proto);
+
+
 
     obj = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, obj, tjs_fs_funcs, countof(tjs_fs_funcs));
