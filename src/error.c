@@ -35,6 +35,7 @@ JSValue tjs_new_error(JSContext *ctx, int err) {
                               JS_NewString(ctx, uv_strerror(err)),
                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     JS_DefinePropertyValueStr(ctx, obj, "errno", JS_NewInt32(ctx, err), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_Throw(ctx, JS_DupValue(ctx, obj)); /* to prevent its early destruction on caller site */
     return obj;
 }
 
